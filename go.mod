@@ -2,6 +2,8 @@ module github.com/clarafu/concourse-lidar-simulator
 
 go 1.14
 
+replace github.com/concourse/concourse => /Users/clarafu/workspace/concourse
+
 require (
 	code.cloudfoundry.org/clock v1.0.0
 	code.cloudfoundry.org/lager v2.0.0+incompatible
@@ -13,4 +15,5 @@ require (
 	github.com/cppforlife/go-patch v0.2.0 // indirect
 	github.com/onsi/ginkgo v1.12.2 // indirect
 	github.com/tedsuo/ifrit v0.0.0-20180802180643-bea94bb476cc
+	go.opentelemetry.io/otel/exporter/trace/jaeger v0.2.1
 )

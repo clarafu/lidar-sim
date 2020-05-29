@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 	"code.cloudfoundry.org/clock"
 	"code.cloudfoundry.org/lager"
 	"code.cloudfoundry.org/lager/lagertest"
+	"go.opentelemetry.io/otel/exporter/trace/jaeger"
 
 	"github.com/concourse/concourse/atc"
 	"github.com/concourse/concourse/atc/builds/buildsfakes"
@@ -20,18 +23,24 @@ import (
 	"github.com/concourse/concourse/atc/db"
 	"github.com/concourse/concourse/atc/db/dbfakes"
 	"github.com/concourse/concourse/atc/db/lock/lockfakes"
+	"github.com/concourse/concourse/atc/engine"
 	"github.com/concourse/concourse/atc/engine/enginefakes"
 	"github.com/concourse/concourse/atc/lidar"
+	"github.com/concourse/concourse/tracing"
 	"github.com/tedsuo/ifrit"
 )
 
 var (
-	resourceCheckingInterval time.Duration
-	lidarRunnerInterval      time.Duration
-	lastRan                  time.Time
-	numOfResources           *int
-	checkDuration            time.Duration
-	fakeChecksStorage        fakeChecksStore
+	resourceCheckingInterval, checkDuration                             time.Duration
+	lidarScannerInterval, lidarCheckerInterval, componentRunnerInterval time.Duration
+	componentsList                                                      map[string]*component
+
+	maxInFlightChecks    uint64
+	numOfResources       int
+	fakeChecksStorage    fakeChecksStore
+	jaegerURL            string
+	randomCheckDurations bool
+	allResources         lockedResources
 )
 
 // This is used for storing all the checks that are scheduled by the scanner.
@@ -43,7 +52,7 @@ var (
 // run in its own goroutine will be able to safely access the scheduled checks
 type fakeChecksStore struct {
 	sync.Mutex
-	ScheduledChecks []db.Check
+	ScheduledChecks map[int]db.Check
 }
 
 type resource struct {
@@ -55,15 +64,77 @@ func (r *resource) LastCheckEndTime() time.Time {
 	return r.lastCheckEndTime
 }
 
-func main() {
-	// Parse flags that
-	err := parseFlags()
-	if err != nil {
-		fmt.Printf("parse flags: %v\n", err)
-		return
+type component struct {
+	dbfakes.FakeComponent
+	lastRan  time.Time
+	interval time.Duration
+}
+
+func (c *component) IntervalElapsed() bool {
+	return time.Now().After(c.lastRan.Add(c.interval))
+}
+
+// Update the last ran value on the component
+func (c *component) UpdateLastRan() error {
+	c.lastRan = time.Now()
+	return nil
+}
+
+// Is constructed of a map of resource IDs to the resource struct, in order to
+// easily access each resource by it's ID. It contains a mutex lock to ensure
+// that the map is only getting accessed once at a time.
+type lockedResources struct {
+	sync.Mutex
+	resources map[int]*resource
+}
+
+type fakeEngine struct {
+	enginefakes.FakeEngine
+}
+
+func (e *fakeEngine) NewCheck(check db.Check) engine.Runnable {
+	return &fakeEngineCheck{
+		FakeRunnable: new(enginefakes.FakeRunnable),
+		resourceID:   check.ID(),
+	}
+}
+
+type fakeEngineCheck struct {
+	*enginefakes.FakeRunnable
+	resourceID int
+}
+
+func (e *fakeEngineCheck) Run(logger lager.Logger) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	resourceCheckDuration := checkDuration
+	if randomCheckDurations {
+		randomDuration := r.Int63n(checkDuration.Nanoseconds())
+		resourceCheckDuration = time.Duration(randomDuration)
 	}
 
-	// Set up faking out all of lidar's depdencies, including the database and
+	time.Sleep(resourceCheckDuration)
+
+	allResources.resources[e.resourceID].lastCheckEndTime = time.Now()
+	fakeChecksStorage.Lock()
+	delete(fakeChecksStorage.ScheduledChecks, e.resourceID)
+	fakeChecksStorage.Unlock()
+}
+
+func main() {
+	// Parse flags
+	parseFlags()
+
+	// Set up tracing if configured with jaeger url
+	if jaegerURL != "" {
+		err := setupTracing()
+		if err != nil {
+			fmt.Printf("setup tracing: %v\n", err)
+			return
+		}
+	}
+
+	// Set up faking out all of lidar's depedencies, including the database and
 	// lock factory. Most of the logic will stay the same, the big difference is
 	// that rather than accessing information from the database, it will access
 	// the information from global variables
@@ -72,32 +143,41 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt)
 
-	err = lidarRunner.Run(sigs, make(chan struct{}))
+	err := lidarRunner.Run(sigs, make(chan struct{}))
 	if err != nil {
 		fmt.Printf("run lidar: %v\n", err)
 	}
 }
 
-func parseFlags() error {
-	var err error
-	resourceCheckingInterval, err = time.ParseDuration(*flag.String("resource-checking-interval", "1m", "the interval resources will be checked on"))
-	if err != nil {
-		return fmt.Errorf("failed to parse resource-checking-interval %v", err)
-	}
-
-	lidarRunnerInterval, err = time.ParseDuration(*flag.String("lidar-runner-interval", "10s", "the interval that the lidar component will run on"))
-	if err != nil {
-		return fmt.Errorf("failed to parse lidar-runner-interval %v", err)
-	}
-
-	numOfResources = flag.Int("number-of-resources", 100, "the number of resources that will be checked")
-
-	checkDuration, err = time.ParseDuration(*flag.String("check-duration", "1s", "how long a check will take to finish"))
-	if err != nil {
-		return fmt.Errorf("failed to parse check-duration %v", err)
-	}
+func parseFlags() {
+	flag.IntVar(&numOfResources, "numberOfResources", 100, "the number of resources that will be checked")
+	flag.StringVar(&jaegerURL, "jaegerURL", "", "jaeger URL that the traces will be sent to")
+	flag.DurationVar(&resourceCheckingInterval, "resourceCheckingInterval", 1*time.Minute, "the interval resources will be checked on")
+	flag.DurationVar(&lidarScannerInterval, "lidarScannerInterval", 1*time.Minute, "the interval which the llidar scanner will run on")
+	flag.DurationVar(&lidarCheckerInterval, "lidarCheckerInterval", 10*time.Second, "the interval which the lidar checker will run on")
+	flag.DurationVar(&componentRunnerInterval, "componentRunnerInterval", 10*time.Second, "the interval which the component runner will run on")
+	flag.DurationVar(&checkDuration, "checkDuration", 1*time.Second, "how long a check will take to finish")
+	flag.BoolVar(&randomCheckDurations, "randomCheckDurations", false, "if true, will cause the durations of checks to be randomized with a maximum duration of the check duration flag (default is 1 second)")
+	flag.Uint64Var(&maxInFlightChecks, "maxInFlightChecks", 32, "maximum number of checks that can run at the same time")
 
 	flag.Parse()
+}
+
+func setupTracing() error {
+	spanSyncer, err := (tracing.Jaeger{
+		Endpoint: jaegerURL + "/api/traces",
+		Service:  "lidar-simulation",
+	}).Exporter()
+	if err != nil {
+		return fmt.Errorf("jaeger exporter: %v", err)
+	}
+
+	exporter := spanSyncer.(*jaeger.Exporter)
+
+	err = tracing.ConfigureTracer(exporter)
+	if err != nil {
+		return fmt.Errorf("configure tracer: %v", err)
+	}
 
 	return nil
 }
@@ -106,7 +186,9 @@ func setupLidar() ifrit.Runner {
 	logger := lagertest.NewTestLogger("lidar-test")
 	clock := clock.NewClock()
 	notifier := make(chan bool, 1)
-	lastRan = time.Now()
+
+	scheduledChecksMap := make(map[int]db.Check)
+	fakeChecksStorage.ScheduledChecks = scheduledChecksMap
 
 	fakeSecrets := new(credsfakes.FakeSecrets)
 	fakeLockFactory := new(lockfakes.FakeLockFactory)
@@ -120,8 +202,8 @@ func setupLidar() ifrit.Runner {
 
 	// Create a slice of the number of resources that are wanted to run this test
 	// with. Default is 100 resources
-	var resources []db.Resource
-	for i := 1; i < *numOfResources; i++ {
+	resources := make(map[int]*resource)
+	for i := 1; i < numOfResources; i++ {
 		fakeResource := new(resource)
 		fakeResource.TeamNameReturns("team")
 		fakeResource.PipelineNameReturns("pipeline")
@@ -132,11 +214,24 @@ func setupLidar() ifrit.Runner {
 		fakeResource.CheckEveryReturns("")
 		fakeResource.CurrentPinnedVersionReturns(nil)
 
-		resources = append(resources, fakeResource)
+		resources[i] = fakeResource
 	}
 
+	allResources.resources = resources
+
 	fakeCheckFactory := new(dbfakes.FakeCheckFactory)
-	fakeCheckFactory.ResourcesReturns(resources, nil)
+	fakeCheckFactory.ResourcesStub = func() ([]db.Resource, error) {
+		allResources.Lock()
+
+		var resources []db.Resource
+		for _, resource := range allResources.resources {
+			resources = append(resources, resource)
+		}
+
+		allResources.Unlock()
+
+		return resources, nil
+	}
 
 	// Do not check custom resource types. Can be added later if we want to see
 	// how the speed of checks are affected by custom resource types
@@ -153,9 +248,12 @@ func setupLidar() ifrit.Runner {
 		fakeCheck.PipelineNameReturns("pipeline")
 		fakeCheck.IDReturns(checkable.ResourceConfigScopeID())
 		fakeCheck.ResourceConfigScopeIDReturns(checkable.ResourceConfigScopeID())
+		fakeCheck.SpanContextReturns(db.NewSpanContext(ctx))
 
 		// Append our check to the scheduled checks in the mock database
-		fakeChecksStorage.ScheduledChecks = append(fakeChecksStorage.ScheduledChecks, fakeCheck)
+		if _, found := fakeChecksStorage.ScheduledChecks[checkable.ResourceConfigScopeID()]; !found {
+			fakeChecksStorage.ScheduledChecks[checkable.ResourceConfigScopeID()] = fakeCheck
+		}
 
 		fakeChecksStorage.Unlock()
 
@@ -169,45 +267,39 @@ func setupLidar() ifrit.Runner {
 
 		// Pull off the scheduled checks from the global variable checks storage
 		// and reset the scheduled checks back to empty
-		checksToStart := fakeChecksStorage.ScheduledChecks
-		fakeChecksStorage.ScheduledChecks = []db.Check{}
+
+		var checksToStart []db.Check
+		for _, j := range fakeChecksStorage.ScheduledChecks {
+			checksToStart = append(checksToStart, j)
+		}
 
 		fakeChecksStorage.Unlock()
 
 		return checksToStart, nil
 	}
 
-	fakeComponent := new(dbfakes.FakeComponent)
-	fakeComponent.PausedReturns(false)
+	fakeScannerComponent := new(component)
+	fakeScannerComponent.PausedReturns(false)
+	fakeScannerComponent.interval = lidarScannerInterval
 
-	// The component will determine if it needs to run if the interval elapsed
-	// returns back true. This logic is the same as how a real component in
-	// Concourse determines it's interval, but is stubbed out to use a global
-	// variable to store the time it last ran rather than a database.
-	fakeComponent.IntervalElapsedStub = func() bool {
-		if time.Now().Sub(lastRan) > lidarRunnerInterval {
-			return true
-		} else {
-			return false
-		}
-	}
+	fakeCheckerComponent := new(component)
+	fakeCheckerComponent.PausedReturns(false)
+	fakeCheckerComponent.interval = lidarCheckerInterval
 
-	// Update the global variable for storing when lidar last ran
-	fakeComponent.UpdateLastRanStub = func() error {
-		lastRan = time.Now()
-		return nil
-	}
+	// Construct the list of components with the lidar scanner and lidar checker fakes
+	componentsList = make(map[string]*component)
+	componentsList[atc.ComponentLidarScanner] = fakeScannerComponent
+	componentsList[atc.ComponentLidarChecker] = fakeCheckerComponent
 
 	fakeComponentFactory := new(dbfakes.FakeComponentFactory)
-	fakeComponentFactory.FindReturns(fakeComponent, true, nil)
+	fakeComponentFactory.FindStub = func(name string) (db.Component, bool, error) {
+		component, found := componentsList[name]
+		if !found {
+			return nil, false, errors.New(fmt.Sprintf("component %s does not exist", name))
+		}
 
-	fakeRunnable := new(enginefakes.FakeRunnable)
-	fakeRunnable.RunStub = func(logger lager.Logger) {
-		time.Sleep(checkDuration)
+		return component, true, nil
 	}
-
-	fakeEngine := new(enginefakes.FakeEngine)
-	fakeEngine.NewCheckReturns(fakeRunnable)
 
 	lidarRunner := lidar.NewRunner(
 		logger,
@@ -223,9 +315,10 @@ func setupLidar() ifrit.Runner {
 		lidar.NewChecker(
 			logger.Session("checker"),
 			fakeCheckFactory,
-			fakeEngine,
+			new(fakeEngine),
+			maxInFlightChecks,
 		),
-		lidarRunnerInterval,
+		componentRunnerInterval,
 		fakeNotifications,
 		fakeLockFactory,
 		fakeComponentFactory,
